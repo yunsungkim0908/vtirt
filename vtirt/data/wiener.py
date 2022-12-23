@@ -112,7 +112,7 @@ class Wiener2PLDataset(Dataset):
         out_dict = {
             'u_id': combined_idx,
             'q_id': torch.LongTensor(self.trial_ques[combined_idx]),
-            'resp': torch.LongTensor(self.resp[combined_idx]),
+            'resp': torch.FloatTensor(self.resp[combined_idx]),
             'mask': torch.LongTensor(self.mask[combined_idx]),
             'kmap': torch.BoolTensor(self.kmap)
         }
