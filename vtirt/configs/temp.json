@@ -16,15 +16,19 @@
         "traj_len": 5
 
     },
-    "train_loader":
+    "train":
     {
-    "batch_size": 128,
-    "num_workers": 16
+        "num_epochs": 100,
+        "loader": {
+            "batch_size": 128,
+            "num_workers": 16
+        }
     },
-    "val_loader":
+    "val":
     {
     },
     "optim":
     {
+        "lr": 3e-4
     }
 }

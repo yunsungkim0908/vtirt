@@ -106,7 +106,7 @@ class VTIRTMultiKC(nn.Module):
             obs=resp
         )
 
-    def guide(self, mask, q_id, kmap, resp):
+    def guide(self, mask, q_id, kmap, resp, stochastic=False):
         pyro.module('diff_mu', self.diff_mu)
         pyro.module('diff_logvar', self.diff_logvar)
         pyro.module('disc_mu', self.disc_mu)
@@ -120,20 +120,24 @@ class VTIRTMultiKC(nn.Module):
         trial_kc_mask = kmap[q_id,:]
 
         qid_enum = torch.arange(num_ques).to(device)
-        diff = pyro.sample(
-            'diff_mu',
-            dist.Normal(
-                self.diff_mu(qid_enum).squeeze(-1),
-                torch.exp(0.5*self.diff_logvar(qid_enum)).squeeze(-1)
-            ).to_event(1)
-        )
-        disc = pyro.sample(
-            'disc_mu',
-            dist.Normal(
-                self.disc_mu(qid_enum).squeeze(-1),
-                torch.exp(0.5*self.disc_logvar(qid_enum)).squeeze(-1)
-            ).to_event(1)
-        )
+        if stochastic:
+            diff = pyro.sample(
+                'diff_mu',
+                dist.Normal(
+                    self.diff_mu(qid_enum).squeeze(-1),
+                    torch.exp(0.5*self.diff_logvar(qid_enum)).squeeze(-1)
+                ).to_event(1)
+            )
+            disc = pyro.sample(
+                'disc_mu',
+                dist.Normal(
+                    self.disc_mu(qid_enum).squeeze(-1),
+                    torch.exp(0.5*self.disc_logvar(qid_enum)).squeeze(-1)
+                ).to_event(1)
+            )
+        else:
+            diff = self.diff_mu(qid_enum).squeeze(-1)
+            disc = self.disc_mu(qid_enum).squeeze(-1)
 
         # U x T x K
         trial_diff_kc = diff[q_id,None].repeat(1,1,num_kcs).permute(1,0,2)
@@ -160,20 +164,21 @@ class VTIRTMultiKC(nn.Module):
         ab_poten_lst = torch.split(trial_ab_poten_flat, split_size)
         alpha_lst, beta_lst = self.get_posterior_ability_params(trial_kc_mask,
                                                                 ab_poten_lst)
-        self.sample_posterior_ability(trial_kc_mask,
+        trial_ability_kc = self.sample_posterior_ability(trial_kc_mask,
                                       ab_poten_lst,
                                       alpha_lst,
                                       beta_lst)
 
-        # trial_diff = diff[q_id]
-        # trial_disc = disc[q_id]
+        trial_ability = (
+            (trial_ability_kc*trial_kc_mask.float()).sum(dim=-1)
+            /(trial_kc_mask.sum(dim=-1).clamp(min=1e-8))
+        )
 
-        # trial_logits = trial_disc*(trial_ability - trial_diff)
+        trial_diff = diff[q_id]
+        trial_disc = disc[q_id]
 
-        # _ = pyro.sample(
-        #     'resp',
-        #     dist.Bernoulli(logits=trial_logits).mask(mask),
-        # )
+        trial_logits = trial_disc*(trial_ability - trial_diff)
+        return trial_logits
 
     def get_posterior_ability_params(self, trial_kc_mask, ab_poten_lst):
         device = self.device
@@ -248,12 +253,7 @@ class VTIRTMultiKC(nn.Module):
             trial_ability_kc.append(curr_kc_ability)
 
         trial_ability_kc = torch.stack(trial_ability_kc, dim=1)
-
-        trial_ability = (
-            (trial_ability_kc*trial_kc_mask.float()).sum(dim=-1)
-            /(trial_kc_mask.sum(dim=-1).clamp(min=1e-8))
-        )
-        return trial_ability
+        return trial_ability_kc
 
     def get_item_features(self):
         all_qids = torch.arange(self.num_ques).to(self.device)
@@ -261,18 +261,38 @@ class VTIRTMultiKC(nn.Module):
         all_discs = self.diff_mu[all_qids].cpu().detach().numpy()
         return all_diffs, all_discs
 
+    def pred_response(self, batch, stochastic=True):
+        mask = batch['mask']
+        q_id = batch['q_id']
+        kmap = batch['kmap']
+        resp = batch['resp']
+
+        num_learners, max_seq_len = mask.size()
+
+        logits, target = [], []
+        for i in range(1, max_seq_len):
+            logits = self.guide(mask[:i,:], q_id[:i,:], kmap[:i,:], resp[:i,:])
+            target.append(torch.masked_select(resp[i], mask[i]))
+            logits.append(torch.masked_select(logits[i], mask[i]))
+
+        logits = torch.cat(logits).cpu().detach().numpy()
+        target = torch.cat(target).cpu().detach().numpy()
+
+        return logits, target
+
     def get_ability_estimates(self):
         pass
 
 
 if __name__=='__main__':
+    device = 'cpu'
     from vtirt.data.wiener import Wiener2PLDataset
     from vtirt.data.utils import to_device
     from torch.utils.data import DataLoader
-    vtirt = VTIRTMultiKC(8, 10).to('cuda:0')
+    vtirt = VTIRTMultiKC(8, 10).to(device)
     dataset = Wiener2PLDataset(8,2,10,5, overwrite=True)
     loader = DataLoader(dataset, batch_size=3, collate_fn=dataset.collate_fn)
-    batch = to_device(next(iter(loader)), 'cuda:0')
+    batch = to_device(next(iter(loader)), device)
     vtirt.model(batch['mask'], batch['q_id'], batch['kmap'], None)
     vtirt.guide(batch['mask'], batch['q_id'], batch['kmap'], batch['resp'])
 

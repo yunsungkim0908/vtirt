@@ -54,9 +54,10 @@ class Wiener2PLDataset(Dataset):
         self.dirname = os.path.join(DATA_DIR, 'bin',
                                     self.get_dataset_str())
 
-        if not os.path.isdir(self.dirname) or overwrite:
-            if overwrite:
-                shutil.rmtree(self.dirname)
+        if os.path.isdir(self.dirname) and overwrite:
+            shutil.rmtree(self.dirname)
+
+        if not os.path.isdir(self.dirname):
             os.makedirs(self.dirname)
             self.generate_and_store_dataset()
         else:
