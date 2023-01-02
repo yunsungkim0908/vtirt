@@ -6,7 +6,9 @@ import torch
 import torch.nn as nn
 import torch.nn.init as init
 
-class VTIRTMultiKC(nn.Module):
+from vtirt.model.irt import dirt_2pl
+
+class VTIRTOld(nn.Module):
     def __init__(
             self,
             hidden_dim,
@@ -59,63 +61,8 @@ class VTIRTMultiKC(nn.Module):
         self.apply(_init_weights)
 
     def model(self, mask, q_id, kmap, resp=None):
-        """
-            mask: shape (U,T)
-            q_id: shape (U,T)
-            resp: shape (U,T)
-            kmap: shape (Q,K)
-        """
-        device = self.device
-
-        num_users, max_seq_len = q_id.size()
-        num_ques, num_kcs = kmap.size()
-        trial_kc_mask = kmap[q_id,:]
-
-        zeros = torch.zeros((num_ques,)).to(device)
-        ones = torch.ones((num_ques,)).to(device)
-        diff = pyro.sample('diff_mu', dist.Normal(zeros,ones).to_event(1))
-        disc = pyro.sample('disc_mu', dist.Normal(ones,ones).to_event(1))
-
-        curr_kc_ability = torch.zeros((num_users, num_kcs)).to(device)
-        trial_ability_kc = []
-        for t in range(max_seq_len):
-            trial_kc_mask_t = trial_kc_mask[:,t]
-
-            mu_t = (
-                torch.masked_select(curr_kc_ability, trial_kc_mask_t)
-            )
-            std_t = self.std_theta * (
-                torch.ones_like(mu_t).to(device)
-            )
-            ability_next = pyro.sample(
-                f'ability_{t+1}',
-                dist.Normal(mu_t, std_t).to_event(1)
-            )
-
-            curr_kc_ability = curr_kc_ability.masked_scatter(
-                trial_kc_mask_t, ability_next
-            )
-            trial_ability_kc.append(curr_kc_ability)
-
-        trial_ability_kc = torch.stack(trial_ability_kc, dim=1)
-
-        trial_ability = (
-            (trial_ability_kc*trial_kc_mask.float()).sum(dim=-1)
-            /(trial_kc_mask.sum(dim=-1).clamp(min=1e-8))
-        )
-
-        trial_diff = diff[q_id]
-        trial_disc = disc[q_id]
-
-        trial_logits = trial_disc*(trial_ability - trial_diff)
-
-        _ = pyro.sample(
-            'resp',
-            dist.Bernoulli(logits=trial_logits)
-                .mask(mask.bool())
-                .to_event(2),
-            obs=resp
-        )
+        dirt_2pl(kmap=kmap, std_theta=self.std_theta, device=self.device,
+                train_mask=mask, train_q_id=q_id, train_resp=resp)
 
     def guide(self, mask, q_id, kmap, resp, stochastic=True):
         pyro.module('diff_mu', self.diff_mu)
@@ -173,16 +120,11 @@ class VTIRTMultiKC(nn.Module):
             split_size.append(split_size_tensor[i])
 
         ab_poten_lst = torch.split(trial_ab_poten_flat, split_size)
-        # alpha_next == alpha_t+1
-        alpha_next, beta_next = self.get_posterior_ability_params(
-            trial_kc_mask, ab_poten_lst
-        )
-        trial_ability_kc = self.sample_posterior_ability(
-            trial_kc_mask,
-            ab_poten_lst,
-            alpha_next,
-            beta_next
-        )
+        b_lst, c_lst = self.get_posterior_ability_params(trial_kc_mask,
+                                                                ab_poten_lst)
+        trial_ability_kc = self.sample_posterior_ability(trial_kc_mask,
+                                      b_lst,
+                                      c_lst)
 
         trial_ability = (
             (trial_ability_kc*trial_kc_mask.float()).sum(dim=-1)
@@ -198,61 +140,37 @@ class VTIRTMultiKC(nn.Module):
 
     def get_posterior_ability_params(self, trial_kc_mask, ab_poten_lst):
         device = self.device
-        lmda_theta = 1/self.std_theta**2
+        std_theta = self.std_theta
         num_users, max_seq_len, num_kcs = trial_kc_mask.size()
 
-        alpha_kc = torch.zeros((num_users, num_kcs)).to(device)
-        beta_kc = torch.zeros((num_users, num_kcs)).to(device)
-        # alpha_next == alpha_{t+1}
-        alpha_next, beta_next = [], []
+        # prepend alpha_t
+        b_lst = [torch.tensor(1).to(device)]
+        c_lst = [torch.tensor(0).to(device)]
         for t in reversed(range(max_seq_len)):
+            # lst[0] has parameters from one time step ahead
             mu_t = ab_poten_lst[t][:,0]
-            logvar_t = ab_poten_lst[t][:,1].clamp(max=1e8)
-            lmda_t = torch.exp(-logvar_t)
-            trial_kc_mask_t = trial_kc_mask[:,t]
+            logvar_t = ab_poten_lst[t][:,1]
+            std_t = torch.exp(0.5*logvar_t).clamp(min=1e-8)
 
-            alpha_t = torch.masked_select(alpha_kc, trial_kc_mask_t)
-            beta_t = torch.masked_select(beta_kc, trial_kc_mask_t)
+            b_t = 1/(1 + (std_theta/std_t)**2 + (1-b_lst[0]))
+            c_t = b_t*(c_lst[0] + (std_theta/std_t)**2*mu_t)
 
-            alpha_next = [alpha_t] + alpha_next
-            beta_next = [beta_t] + beta_next
-            if t == 0:
-                break
+            b_lst = [b_t] + b_lst
+            c_lst = [c_t] + c_lst
 
-            beta_t = (
-                (lmda_t*mu_t + alpha_t*lmda_theta*beta_t)
-                /
-                (lmda_t + alpha_t*lmda_theta)
-            )
-            alpha_t = (
-                (lmda_t + alpha_t*lmda_theta)
-                /
-                (lmda_theta + lmda_t + alpha_t*lmda_theta)
-            )
+        return b_lst, c_lst
 
-            alpha_kc = alpha_kc.masked_scatter(trial_kc_mask_t, alpha_t)
-            beta_kc = beta_kc.masked_scatter(trial_kc_mask_t, beta_t)
-
-        return alpha_next, beta_next
-
-    def sample_posterior_ability(
-            self,
-            trial_kc_mask,
-            ab_poten_lst,
-            alpha_next,
-            beta_next
-    ):
+    def sample_posterior_ability(self, trial_kc_mask, b_lst, c_lst):
         device = self.device
         std_theta = self.std_theta
-        lmda_theta = 1/self.std_theta**2
+        std_theta = self.std_theta
         num_users, max_seq_len, num_kcs = trial_kc_mask.size()
 
         curr_kc_ability = torch.zeros((num_users, num_kcs)).to(device)
         trial_ability_kc = []
         for t in range(max_seq_len):
-            mu_t = ab_poten_lst[t][:,0]
-            logvar_t = ab_poten_lst[t][:,1].clamp(max=1e8)
-            lmda_t = torch.exp(-logvar_t)
+            b_t = b_lst[t]
+            c_t = c_lst[t]
 
             trial_kc_mask_t = trial_kc_mask[:,t]
 
@@ -260,15 +178,8 @@ class VTIRTMultiKC(nn.Module):
                 torch.masked_select(curr_kc_ability, trial_kc_mask_t)
             )
 
-            std_tilde_t = std_theta*torch.sqrt(1-alpha_next[t])
-            mu_tilde_t = (
-                (lmda_theta*ability_prev
-                 + lmda_t*mu_t
-                 + alpha_next[t]*lmda_theta*beta_next[t]
-                )
-                /
-                (lmda_theta + lmda_t + alpha_next[t]*lmda_theta)
-            )
+            std_tilde_t = std_theta*torch.sqrt(b_t)
+            mu_tilde_t = b_t*ability_prev + c_t
 
             ability_next = pyro.sample(
                 f'ability_{t+1}',
@@ -334,7 +245,7 @@ if __name__=='__main__':
     from vtirt.data.wiener import Wiener2PLDataset
     from vtirt.data.utils import to_device
     from torch.utils.data import DataLoader
-    vtirt = VTIRTMultiKC(8, 10).to(device)
+    vtirt = VTIRTOld(8, 10).to(device)
     dataset = Wiener2PLDataset(8,2,10,5, overwrite=True)
     loader = DataLoader(dataset, batch_size=3, collate_fn=dataset.collate_fn)
     batch = to_device(next(iter(loader)), device)

@@ -14,11 +14,12 @@ def sigmoid(x):
 
 class Wiener2PLDataset(Dataset):
     DATA_ATTR_LIST = [
+        'trial_logits',
         'trial_ability',
-        'trial_ques',
+        'q_id',
         'trial_diff',
         'trial_disc',
-        'trial_p',
+        'trial_probs',
         'diff',
         'disc',
         'resp',
@@ -33,23 +34,26 @@ class Wiener2PLDataset(Dataset):
             num_ques,
             traj_len,
             split='valid',
-            std_init=0.125,
-            std_theta=0.125,
+            std_init=0.25,
+            std_theta=0.25,
             std_diff=1,
             std_disc=1,
-            overwrite=False
+            overwrite=False,
+            data_no=0,
     ):
         super().__init__()
         self.num_train = num_train
         self.num_valid = num_valid
 
         self.n_U = num_train + num_valid
-        self.n_Q = num_ques
+        self.num_ques = num_ques
         self.traj_len = traj_len
         self.std_init = std_init
         self.std_theta = std_theta
         self.std_diff = std_diff
         self.std_disc = std_disc
+        self.num_kcs = 1
+        self.data_no = data_no
 
         self.dirname = os.path.join(DATA_DIR, 'bin',
                                     self.get_dataset_str())
@@ -59,47 +63,63 @@ class Wiener2PLDataset(Dataset):
 
         if not os.path.isdir(self.dirname):
             os.makedirs(self.dirname)
-            self.generate_and_store_dataset()
+            print(f'generating data: {self.dirname}')
+            self.generate_and_store_full_dataset()
         else:
-            self.load_dataset()
+            print(f'loading data: {self.dirname}')
+            self.load_full_dataset()
+
+        self.get_split()
 
         self.split = split
 
     def get_dataset_str(self):
         return (
-            f'Wiener2PL_Q{self.n_Q}_traj{self.traj_len}'
+            f'Wiener2PL_Q{self.num_ques}_traj{self.traj_len}'
             f'_stdInit{self.std_init}_stdAb{self.std_theta}'
             f'_stdDiff{self.std_diff}_stdDisc{self.std_disc}'
             f'_train{self.num_train}_val{self.num_valid}'
+            f'_no{self.data_no}'
         )
 
-    def load_dataset(self):
+    def load_full_dataset(self):
         for attr in self.DATA_ATTR_LIST:
             path = os.path.join(self.dirname, f'{attr}.npy')
             setattr(self, attr, np.load(path))
 
-    def generate_and_store_dataset(self):
+    def get_split(self):
+        self.trial_logits = self.trial_logits[:self.num_train]
+        self.trial_ability = self.trial_ability[:self.num_train]
+        self.q_id = self.q_id[:self.num_train]
+        self.trial_diff = self.trial_diff[:self.num_train]
+        self.trial_disc = self.trial_disc[:self.num_train]
+        self.trial_probs = self.trial_probs[:self.num_train]
+        self.resp = self.resp[:self.num_train]
+        self.mask = self.mask[:self.num_train]
+
+    def generate_and_store_full_dataset(self):
         ab_init = np.random.randn(self.n_U, 1, 1)*self.std_init
         ab_delta = np.random.randn(self.n_U, self.traj_len-1, 1)*self.std_theta
 
-        trial_ability = np.concatenate([ab_init, ab_delta], axis=1).cumsum(axis=0)
+        trial_ability = np.concatenate([ab_init, ab_delta], axis=1).cumsum(axis=1)
 
         rng = np.random.default_rng()
-        questions = np.expand_dims(np.arange(self.n_Q), axis=0)
+        questions = np.expand_dims(np.arange(self.num_ques), axis=0)
         questions = np.tile(questions, (self.n_U, 1))
-        trial_ques = rng.permuted(questions, axis=1)[:,:self.traj_len]
+        q_id = rng.permuted(questions, axis=1)[:,:self.traj_len]
 
-        diff = np.random.randn(self.n_Q, 1)*self.std_diff
-        disc = np.random.randn(self.n_Q, 1)*self.std_disc
+        diff = np.random.randn(self.num_ques, 1)*self.std_diff
+        disc = 1 + np.random.randn(self.num_ques, 1)*self.std_disc
 
-        trial_diff = diff[trial_ques,:]
-        trial_disc = disc[trial_ques,:]
+        trial_diff = diff[q_id,:]
+        trial_disc = disc[q_id,:]
 
-        trial_p = sigmoid(trial_disc*(trial_ability - trial_diff)).squeeze(-1)
+        trial_logits = trial_disc*(trial_ability - trial_diff)
+        trial_probs = sigmoid(trial_disc*(trial_ability - trial_diff)).squeeze(-1)
 
-        resp = stats.bernoulli(trial_p).rvs()
+        resp = stats.bernoulli(trial_probs).rvs()
         mask = np.ones_like(resp).astype(bool)
-        kmap = np.ones((self.n_Q, 1)).astype(bool)
+        kmap = np.ones((self.num_ques, 1)).astype(bool)
 
         for attr in self.DATA_ATTR_LIST:
             val = locals()[attr]
@@ -108,14 +128,15 @@ class Wiener2PLDataset(Dataset):
             np.save(path, val)
 
     def __getitem__(self, idx):
-        combined_idx = idx + (0 if self.split == 'train'
-                                else self.num_train)
+        ability = torch.FloatTensor(self.trial_ability[idx])
+        combined_idx = (0 if self.split == 'train' else self.num_train) + idx
         out_dict = {
             'u_id': combined_idx,
-            'q_id': torch.LongTensor(self.trial_ques[combined_idx]),
-            'resp': torch.FloatTensor(self.resp[combined_idx]),
-            'mask': torch.LongTensor(self.mask[combined_idx]),
-            'kmap': torch.BoolTensor(self.kmap)
+            'q_id': torch.LongTensor(self.q_id[idx]),
+            'resp': torch.FloatTensor(self.resp[idx]),
+            'mask': torch.LongTensor(self.mask[idx]),
+            'kmap': torch.BoolTensor(self.kmap),
+            'ability': ability
         }
         return out_dict
 
@@ -126,12 +147,13 @@ class Wiener2PLDataset(Dataset):
             'q_id': torch.stack([b['q_id'] for b in batch], dim=0),
             'resp': torch.stack([b['resp'] for b in batch], dim=0),
             'mask': torch.stack([b['mask'] for b in batch], dim=0),
-            'kmap': batch[0]['kmap']
+            'kmap': batch[0]['kmap'],
+            'ability': torch.stack([b['ability'] for b in batch], dim=0)
         }
         return out_dict
 
     def __len__(self):
-        return self.num_train if self.split == 'train' else self.num_valid
+        return self.resp.shape[0]
 
 if __name__=='__main__':
     from torch.utils.data import DataLoader
