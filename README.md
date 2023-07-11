@@ -12,6 +12,7 @@ pip install -e .
 cd vtirt
 pip install -r requirements.txt
 ```
+These commands will create a conda environment named `vtirt` and install the required packages. All source code is contained in the directory named `vtirt`.
 
 ## Running Experiments
 
