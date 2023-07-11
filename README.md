@@ -15,7 +15,7 @@ pip install -r requirements.txt
 
 ## Running Experiments
 
-This repository has code for running different types of inference algorithms: `exp/svi.py` (Stochastic Variational Inference), `exp/hmc.py` (Hamiltonian Monte Carlo), `exp/vem.py` (Variational EM), and `exp/tskirt.py`. VTIRT and VIBO are trained and evaluated using `exp/svi.py`, which can be executed with the following command:
+This repository has code for running different types of inference experiments: `exp/svi.py` (Stochastic Variational Inference), `exp/hmc.py` (Hamiltonian Monte Carlo), `exp/vem.py` (Variational EM), and `exp/tskirt.py`. VTIRT and VIBO are trained and evaluated using `exp/svi.py`, which can be executed with the following command:
 ```
 python svi.py [-h] [--device DEVICE] [--infer-only] [--valid-once]
               [--overwrite] [--resume-training] [--run-id RUN_ID]
@@ -38,3 +38,5 @@ options:
 ```
 python configs/[vem,tskirt,vtirt]/gen_scripts.py
 ```
+
+When an experiment is run, it stores all performance results along with model checkpoints, there is if any, under `OUT_DIR` (defined in `const.py`).
