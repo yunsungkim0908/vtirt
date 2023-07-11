@@ -8,6 +8,7 @@ import sklearn.metrics as metrics
 import scipy.stats as stats
 from tqdm import tqdm
 from pprint import pprint
+import shutil
 
 import torch
 import torch.optim as torch_optim
@@ -23,12 +24,11 @@ from vtirt.model.vtirt_multi_kc import VTIRTMultiKC
 from vtirt.model.vtirt_single_kc import (
     VTIRTSingleKC, VTIRTSingleKCIndep, VTIRTSingleKCDirect, VIBOSingleKC
 )
-from vtirt.model.vtirt_old import VTIRTOld
 from vtirt.const import OUT_DIR, CONFIG_DIR
 
 class ExpSVI:
 
-    def __init__(self, config, device, out_dir, infer_only=False):
+    def __init__(self, config, device, out_dir, infer_only=False, resume_training=False):
         self.config = config
         self.device = device
 
@@ -53,11 +53,20 @@ class ExpSVI:
         _set_agent_config_from_data('std_theta')
         _set_agent_config_from_data('std_diff')
         _set_agent_config_from_data('std_disc')
+        _set_agent_config_from_data('item_char')
 
         pprint(config.toDict())
 
-        self.agent = globals()[exp_config.model](**self.config.agent).to(device)
         self.out_dir = out_dir
+        self.last_ckpt_path = os.path.join(self.out_dir, 'last.ckpt')
+        self.agent = globals()[exp_config.model](**self.config.agent).to(device)
+        if resume_training:
+            ckpt = torch.load(self.last_ckpt_path, map_location=self.device)
+            self.agent.load_state_dict(ckpt['state_dict'])
+            self.start_epoch = ckpt['epoch'] + 1
+            print(f'resuming training from epoch {self.start_epoch}...')
+        else:
+            self.start_epoch = 0
         self.writer = SummaryWriter(log_dir=self.out_dir)
 
     def train(self):
@@ -74,7 +83,9 @@ class ExpSVI:
         best_perf_path = os.path.join(self.out_dir, 'best_perf.json')
 
         total_train_time = 0.0
-        for epoch in range(self.config.train.num_epochs):
+        start_epoch = self.start_epoch
+        end_epoch = start_epoch + self.config.train.num_epochs
+        for epoch in range(start_epoch, end_epoch):
             print(f'============ epoch {epoch} ============')
             self.agent.train()
             epoch_loss = 0.0
@@ -99,7 +110,7 @@ class ExpSVI:
             perf_dict['epoch'] = epoch
             perf_dict['total_train_time'] = total_train_time
 
-            if 'NextResp/auroc' not in perf_dict:
+            if 'NextResp/auroc' in perf_dict:
                 main_metric = 'NextResp/auroc'
             else:
                 main_metric = 'InferAbility/pearsonr'
@@ -112,15 +123,14 @@ class ExpSVI:
             with open(perf_path, 'w') as f:
                 json.dump(perf_dict, f, indent=4)
 
-        ckpt_path = os.path.join(self.out_dir, 'last.ckpt')
-        ckpt = {
-            'epoch': epoch,
-            'state_dict': self.agent.state_dict()
-        }
-        torch.save(ckpt, ckpt_path)
+            ckpt = {
+                'epoch': epoch,
+                'state_dict': self.agent.state_dict()
+            }
+            torch.save(ckpt, self.last_ckpt_path)
 
     @torch.no_grad()
-    def valid(self, epoch):
+    def valid(self, epoch, stochastic=True):
         self.agent.eval()
 
         perf_dict = {}
@@ -143,11 +153,11 @@ class ExpSVI:
             batch = to_device(batch, self.device)
 
             if not self.infer_only:
-                inf_start = time.time()
+                pred_start = time.time()
                 logits, target, pred_ab, true_ab \
-                    = self.agent.pred_response(batch)
-                inf_end = time.time()
-                inf_time += (inf_end - inf_start)
+                    = self.agent.pred_response(batch, stochastic=stochastic)
+                pred_end = time.time()
+                pred_time += (pred_end - pred_start)
 
                 logits_lst.append(logits)
                 target_lst.append(target)
@@ -157,10 +167,10 @@ class ExpSVI:
                     true_ab_lst.append(true_ab)
 
             if 'ability' in batch:
-                pred_start = time.time()
+                inf_start = time.time()
                 inf_ab, inf_true_ab = self.agent.infer_ability(batch)
-                pred_end = time.time()
-                pred_time += (pred_end - pred_start)
+                inf_end = time.time()
+                inf_time += (inf_end - inf_start)
 
                 inf_ab_lst.append(inf_ab)
                 inf_ab_true_lst.append(inf_true_ab)
@@ -250,6 +260,9 @@ if __name__=='__main__':
     parser.add_argument('config_path', type=str)
     parser.add_argument('--device', type=str, default='cpu')
     parser.add_argument('--infer-only', action='store_true')
+    parser.add_argument('--valid-once', action='store_true')
+    parser.add_argument('--overwrite', action='store_true')
+    parser.add_argument('--resume-training', action='store_true')
     parser.add_argument('--run-id', type=int, default=None)
     args = parser.parse_args()
 
@@ -265,5 +278,13 @@ if __name__=='__main__':
     base_dirname += '' if args.run_id is None else f'_{args.run_id}'
     out_dirname = os.path.join(OUT_DIR, base_dirname)
 
-    exp = ExpSVI(config, device, out_dirname, args.infer_only)
-    exp.run()
+    if args.overwrite and os.path.isdir(out_dirname):
+        print(f'overwriting {out_dirname}...')
+        shutil.rmtree(out_dirname)
+
+    if not os.path.isdir(out_dirname) or args.resume_training:
+        exp = ExpSVI(config, device, out_dirname, args.infer_only, args.resume_training)
+        if args.valid_once:
+            exp.valid(epoch=0, stochastic=False)
+        else:
+            exp.run()

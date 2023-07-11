@@ -1,6 +1,8 @@
 import argparse
 import os
 import json
+import shutil
+import time
 from dotmap import DotMap
 from tqdm import tqdm, trange
 from pprint import pprint
@@ -23,6 +25,7 @@ class ExpTSKIRT:
         self.config = config
         self.device = device
         self.out_dir = out_dir
+        os.makedirs(out_dir)
 
         exp_config = self.config.exp
 
@@ -118,6 +121,7 @@ class ExpTSKIRT:
             collate_fn=self.train_dataset.collate_fn
         )
 
+        total_inf_time = 0.0
         pred_ab_lst, true_ab_lst = [], []
         for batch in tqdm(loader):
             batch = to_device(batch, self.device)
@@ -128,12 +132,15 @@ class ExpTSKIRT:
 
             _, max_seq_len = mask.size()
             for t in trange(max_seq_len):
+                start = time.time()
                 pred_ab, true_ab = self.infer_ability(
                     q_id[:,:t+1],
                     mask[:,t],
                     resp[:,:t+1],
                     ability[:,t,0] if ability is not None else None
                 )
+                end = time.time()
+                total_inf_time += (end - start)
                 pred_ab_lst.append(pred_ab)
                 if true_ab is not None:
                     true_ab_lst.append(true_ab)
@@ -142,6 +149,7 @@ class ExpTSKIRT:
         true_ab = np.concatenate(true_ab_lst)
 
         perf_dict = {}
+        perf_dict['inf_time'] = total_inf_time
         if len(true_ab_lst) > 0:
             ab_spr = stats.spearmanr(pred_ab, true_ab).correlation
             ab_prr = stats.pearsonr(pred_ab, true_ab).statistic
@@ -152,11 +160,15 @@ class ExpTSKIRT:
             perf_dict['InferAbility/pearsonr'] = ab_prr
 
         pprint(perf_dict)
+        perf_filename = os.path.join(self.out_dir, 'perf.json')
+        with open(perf_filename, 'w') as f:
+            json.dump(perf_dict, f, indent=4)
 
 if __name__=='__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('config_path', type=str)
     parser.add_argument('--device', type=str, default='cpu')
+    parser.add_argument('--overwrite', action='store_true')
     parser.add_argument('--infer-only', action='store_true')
     args = parser.parse_args()
 
@@ -171,5 +183,10 @@ if __name__=='__main__':
     base_dirname = config.path.split('configs/')[-1].split('.json')[0]
     out_dirname = os.path.join(OUT_DIR, base_dirname)
 
-    exp = ExpTSKIRT(config, device, out_dirname)
-    exp.run()
+    if args.overwrite and os.path.isdir(out_dirname):
+        print(f'overwriting {out_dirname}...')
+        shutil.rmtree(out_dirname)
+
+    if not os.path.isdir(out_dirname):
+        exp = ExpTSKIRT(config, device, out_dirname)
+        exp.run()

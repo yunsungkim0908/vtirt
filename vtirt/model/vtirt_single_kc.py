@@ -3,10 +3,18 @@ import pyro
 import pyro.distributions as dist
 from typing import Dict, List
 
+from tqdm import trange
 import torch
 import torch.nn as nn
 import torch.nn.init as init
 import torch.nn.utils.rnn as rnn_utils
+
+from vtirt.model.irt import dirt_2param
+
+ITEM_CHAR_FUNC={
+    'logistic': lambda x: torch.sigmoid(x),
+    'normal': lambda x: (1 + torch.erf(x/math.sqrt(2)))/2
+}
 
 class VTIRTSingleKC(nn.Module):
     def __init__(
@@ -17,13 +25,15 @@ class VTIRTSingleKC(nn.Module):
             std_init=1,
             std_theta=1,
             std_diff=1,
-            std_disc=1
+            std_disc=1,
+            item_char='logistic'
     ):
         super().__init__()
         self.std_init = std_init
         self.std_theta = std_theta
         self.std_diff = std_diff
         self.std_disc = std_disc
+        self.item_char = item_char
 
         self.hidden_dim = hidden_dim
         self.num_ques = num_ques
@@ -49,7 +59,6 @@ class VTIRTSingleKC(nn.Module):
             nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.GELU(),
             nn.Linear(self.hidden_dim, 2),
-            nn.GELU()
         )
 
         def _init_weights(m):
@@ -102,10 +111,11 @@ class VTIRTSingleKC(nn.Module):
         trial_disc = disc[q_id]
 
         trial_logits = trial_disc*(trial_ability - trial_diff)
+        trial_probs = ITEM_CHAR_FUNC[self.item_char](trial_logits)
 
         _ = pyro.sample(
             'resp',
-            dist.Bernoulli(logits=trial_logits)
+            dist.Bernoulli(probs=trial_probs)
                 .mask(mask.bool())
                 .to_event(2),
             obs=resp
@@ -124,7 +134,7 @@ class VTIRTSingleKC(nn.Module):
             trial_ab_poten, mask
         )
         trial_ability = self.sample_posterior_ability(
-            mask, trial_ab_poten, a_lst, b_lst
+            mask, trial_ab_poten, a_lst, b_lst, stochastic=stochastic
         )
 
         trial_diff = diff[q_id]
@@ -202,7 +212,7 @@ class VTIRTSingleKC(nn.Module):
 
         return a_lst, b_lst
 
-    def sample_posterior_ability(self, mask, trial_ab_poten, a_lst, b_lst):
+    def sample_posterior_ability(self, mask, trial_ab_poten, a_lst, b_lst, stochastic=True):
         device = self.device
         std_theta = self.std_theta
         lmda_theta = 1/self.std_theta**1
@@ -228,15 +238,22 @@ class VTIRTSingleKC(nn.Module):
                 (lmda_theta + lmda_t + a_next*lmda_theta)
             )
 
-            ab_t = pyro.sample(
-                f'ability_{t+1}',
-                dist.Normal(mu_tilde_t, std_tilde_t).to_event(1)
-            )
+            if stochastic or t == (max_seq_len - 1):
+                ab_t = pyro.sample(
+                    f'ability_{t+1}',
+                    dist.Normal(mu_tilde_t, std_tilde_t).to_event(1)
+                )
+            else:
+                ab_t = mu_tilde_t
 
             ability_t = ability_t.masked_scatter(mask_t, ab_t)
-            ability.append(ability_t)
+            if stochastic:
+                ability.append(ability_t)
 
-        trial_ability= torch.stack(ability, dim=1)
+        if stochastic:
+            trial_ability= torch.stack(ability, dim=1)
+        else:
+            trial_ability = ability_t.unsqueeze(1)
         return trial_ability
 
     def get_item_features(self):
@@ -274,7 +291,7 @@ class VTIRTSingleKC(nn.Module):
         num_learners, max_seq_len = mask.size()
 
         preds, target, pred_ab, true_ab = [], [], [], []
-        for t in range(max_seq_len):
+        for t in trange(max_seq_len, leave=False):
             logits, trial_ability = self.guide(
                 mask[:,:t+1], q_id[:,:t+1], None, resp[:,:t+1], stochastic=False
             )
@@ -322,7 +339,8 @@ class VTIRTSingleKCIndep(VTIRTSingleKC):
         for t in range(max_seq_len):
             mask_t = mask[:,t]
             mu_t = trial_ab_poten[:,t,0][mask_t]
-            std_t = torch.exp(0.5*trial_ab_poten[:,t,1])[mask_t]
+            logvar_t = trial_ab_poten[:,t,0][mask_t]
+            std_t = torch.exp(0.5*logvar_t)[mask_t]
 
             # update ability
             ab_t = pyro.sample(
@@ -359,7 +377,6 @@ class VTIRTSingleKCDirect(VTIRTSingleKC):
                 nn.Linear(self.hidden_dim, self.hidden_dim),
                 nn.GELU(),
                 nn.Linear(self.hidden_dim, 3),
-                nn.GELU()
             )
         elif self.encoder_type == 's2s':
             self.post_param_lstm = nn.LSTM(input_size=3,
@@ -370,8 +387,7 @@ class VTIRTSingleKCDirect(VTIRTSingleKC):
             self.post_param_enc = nn.Sequential(
                 nn.Linear(2*self.hidden_dim, self.hidden_dim),
                 nn.GELU(),
-                nn.Linear(self.hidden_dim, 3),
-                nn.GELU()
+                nn.Linear(self.hidden_dim, 3)
             )
         else:
             raise NotImplementedError
@@ -399,8 +415,9 @@ class VTIRTSingleKCDirect(VTIRTSingleKC):
         elif self.encoder_type == 's2s':
             lengths = mask.sum(dim=1).cpu()
             lstm_in = rnn_utils.pack_padded_sequence(
-               post_param_inp,
-               lengths, batch_first=True
+                post_param_inp,
+                lengths,
+                batch_first=True
             )
             lstm_out, _ = self.post_param_lstm(lstm_in)
             lstm_out, length = rnn_utils.pad_packed_sequence(
@@ -425,19 +442,19 @@ class VTIRTSingleKCDirect(VTIRTSingleKC):
 
         scale = post_param[...,0]
         bias = post_param[...,1]
-        logvar = post_param[...,2]
+        std = torch.exp(0.5*post_param[...,2])
 
         ability_t = torch.zeros(num_users).to(device)
         ability = []
         for t in pyro.markov(range(max_seq_len)):
             mask_t = mask[:,t].bool()
 
-            ab_t = torch.masked_select(ability_t, mask_t)
-            scale_t = scale[:,t]
-            bias_t = bias[:,t]
+            ab_t = ability_t.masked_select(mask_t)
+            scale_t = scale[:,t].masked_select(mask_t)
+            bias_t = bias[:,t].masked_select(mask_t)
 
-            mu_t = scale_t * ab_t + bias_t
-            std_t = torch.exp(0.5*logvar[:,t])
+            mu_t = scale_t*ab_t + bias_t
+            std_t = std[:,t].masked_select(mask_t)
 
             ab_t = pyro.sample(
                 f'ability_{t+1}',
@@ -540,10 +557,11 @@ class VIBOSingleKC(VTIRTSingleKC):
         trial_disc = disc[q_id]
 
         trial_logits = trial_disc*(trial_ability - trial_diff)
+        trial_probs = ITEM_CHAR_FUNC[self.item_char](trial_logits)
 
         _ = pyro.sample(
             'resp',
-            dist.Bernoulli(logits=trial_logits)
+            dist.Bernoulli(probs=trial_probs)
                 .mask(mask.bool())
                 .to_event(2),
             obs=resp

@@ -2,6 +2,7 @@ import os
 import shutil
 import numpy as np
 import scipy.stats as stats
+from scipy import special
 
 import torch
 import torch.nn as nn
@@ -9,8 +10,10 @@ from torch.utils.data import Dataset
 
 from vtirt.const import DATA_DIR
 
-def sigmoid(x):
-  return 1 / (1 + np.exp(-x))
+ITEM_CHAR_FUNC={
+    'logistic': lambda x: 1 / (1 + np.exp(-x)),
+    'normal': lambda x: (1 + special.erf(x/np.sqrt(2)))/2,
+}
 
 class Wiener2PLDataset(Dataset):
     DATA_ATTR_LIST = [
@@ -39,6 +42,7 @@ class Wiener2PLDataset(Dataset):
             std_diff=1,
             std_disc=1,
             overwrite=False,
+            item_char='logistic',
             data_no=0,
     ):
         super().__init__()
@@ -48,11 +52,15 @@ class Wiener2PLDataset(Dataset):
         self.n_U = num_train + num_valid
         self.num_ques = num_ques
         self.traj_len = traj_len
-        self.std_init = std_init
-        self.std_theta = std_theta
-        self.std_diff = std_diff
-        self.std_disc = std_disc
+        self.std_init = float(std_init)
+        self.std_theta = float(std_theta)
+        self.std_diff = float(std_diff)
+        self.std_disc = float(std_disc)
+        self.mu_diff = 0.
+        self.mu_disc = 1.
+        self.mu_theta = 1.
         self.num_kcs = 1
+        self.item_char = item_char
         self.data_no = data_no
 
         self.dirname = os.path.join(DATA_DIR, 'bin',
@@ -69,13 +77,13 @@ class Wiener2PLDataset(Dataset):
             print(f'loading data: {self.dirname}')
             self.load_full_dataset()
 
-        self.get_split()
-
         self.split = split
+        self.get_split()
 
     def get_dataset_str(self):
         return (
-            f'Wiener2PL_Q{self.num_ques}_traj{self.traj_len}'
+            f'Wiener_{self.item_char}_Q{self.num_ques}'
+            f'_traj{self.traj_len}'
             f'_stdInit{self.std_init}_stdAb{self.std_theta}'
             f'_stdDiff{self.std_diff}_stdDisc{self.std_disc}'
             f'_train{self.num_train}_val{self.num_valid}'
@@ -88,14 +96,24 @@ class Wiener2PLDataset(Dataset):
             setattr(self, attr, np.load(path))
 
     def get_split(self):
-        self.trial_logits = self.trial_logits[:self.num_train]
-        self.trial_ability = self.trial_ability[:self.num_train]
-        self.q_id = self.q_id[:self.num_train]
-        self.trial_diff = self.trial_diff[:self.num_train]
-        self.trial_disc = self.trial_disc[:self.num_train]
-        self.trial_probs = self.trial_probs[:self.num_train]
-        self.resp = self.resp[:self.num_train]
-        self.mask = self.mask[:self.num_train]
+        if self.split == 'train':
+            self.trial_logits = self.trial_logits[:self.num_train]
+            self.trial_ability = self.trial_ability[:self.num_train]
+            self.q_id = self.q_id[:self.num_train]
+            self.trial_diff = self.trial_diff[:self.num_train]
+            self.trial_disc = self.trial_disc[:self.num_train]
+            self.trial_probs = self.trial_probs[:self.num_train]
+            self.resp = self.resp[:self.num_train]
+            self.mask = self.mask[:self.num_train]
+        else:
+            self.trial_logits = self.trial_logits[self.num_train:]
+            self.trial_ability = self.trial_ability[self.num_train:]
+            self.q_id = self.q_id[self.num_train:]
+            self.trial_diff = self.trial_diff[self.num_train:]
+            self.trial_disc = self.trial_disc[self.num_train:]
+            self.trial_probs = self.trial_probs[self.num_train:]
+            self.resp = self.resp[self.num_train:]
+            self.mask = self.mask[self.num_train:]
 
     def generate_and_store_full_dataset(self):
         ab_init = np.random.randn(self.n_U, 1, 1)*self.std_init
@@ -114,8 +132,9 @@ class Wiener2PLDataset(Dataset):
         trial_diff = diff[q_id,:]
         trial_disc = disc[q_id,:]
 
+        item_char_f = ITEM_CHAR_FUNC[self.item_char]
         trial_logits = trial_disc*(trial_ability - trial_diff)
-        trial_probs = sigmoid(trial_disc*(trial_ability - trial_diff)).squeeze(-1)
+        trial_probs = item_char_f(trial_logits).squeeze(-1)
 
         resp = stats.bernoulli(trial_probs).rvs()
         mask = np.ones_like(resp).astype(bool)

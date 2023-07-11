@@ -1,10 +1,17 @@
 import numpy as np
 
+import math
 import torch
 import pyro
 import pyro.distributions as dist
 
-def dirt_2pl(
+ITEM_CHAR_FUNC={
+    'logistic': lambda x: torch.sigmoid(x),
+    'normal': lambda x: (1 + torch.erf(x/math.sqrt(2)))/2
+}
+
+
+def dirt_2param(
         kmap,
         std_diff,
         std_disc,
@@ -16,6 +23,7 @@ def dirt_2pl(
         inf_mask=None,
         inf_q_id=None,
         inf_resp=None,
+        item_char='logistic',
         device='cpu',
 ):
     """
@@ -74,10 +82,11 @@ def dirt_2pl(
         trial_disc = disc[q_id]
 
         trial_logits = trial_disc*(trial_ability - trial_diff)
+        trial_probs = ITEM_CHAR_FUNC[item_char](trial_logits)
 
         _ = pyro.sample(
             mode_prefix + 'resp',
-            dist.Bernoulli(logits=trial_logits)
+            dist.Bernoulli(probs=trial_probs)
                 .mask(mask.bool())
                 .to_event(2),
             obs=resp
