@@ -40,4 +40,4 @@ options:
 python configs/[vem,tskirt,vtirt]/gen_scripts.py
 ```
 
-When an experiment is run, it stores all performance results along with model checkpoints, there is if any, under `OUT_DIR` (defined in `const.py`).
+When an experiment is run, it stores all performance results along with model checkpoints - if there is if any - under the `out/` directory.
